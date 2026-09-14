@@ -9,8 +9,8 @@
 
  Architecture & Features:
  - Background Tray App: Lives in the Windows System Tray (Ethereum logo icon).
- - Transfer Detection: Compares block-by-block balance changes and decodes
-   ERC-20 Transfer events to filter out non-transfer transactions.
+ - Transfer Detection: Scans each new block for value-bearing transactions
+   (native ETH) and decodes ERC-20 Transfer events via eth_getLogs.
  - Notifications: Desktop toast popups and audio chimes on each detected transfer.
  - GUI Log Dashboard: Double-click the tray icon to view live activity and logs.
  - Safe Exit: Closing the GUI window [X] minimizes back to tray; right-click tray icon to exit.
@@ -23,9 +23,20 @@ param (
     [string[]]$WalletAddresses,
 
     [string]$WalletsFile  = "wallets.txt",
-    [string]$RpcUrl       = "https://cloudflare-eth.com",
+    [string]$RpcUrl       = "",
     [int]$PollInterval    = 15
 )
+
+# Public Ethereum RPC endpoints tried in order until one responds successfully
+$script:RpcEndpoints = @(
+    "https://ethereum.publicnode.com",
+    "https://1rpc.io/eth",
+    "https://rpc.flashbots.net",
+    "https://virginia.rpc.blxrbdn.com",
+    "https://rpc.ankr.com/eth"
+)
+# If caller passed an explicit RpcUrl, put it first
+if ($RpcUrl) { $script:RpcEndpoints = @($RpcUrl) + $script:RpcEndpoints }
 
 # ------------------------------------------------------------------------------
 # 1. Hide the Host Console Window (Ensure 100% background execution)
@@ -35,7 +46,7 @@ Add-Type -Name Win32Utils -Namespace Win32 -MemberDefinition @"
     public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
     [System.Runtime.InteropServices.DllImport("kernel32.dll")]
     public static extern System.IntPtr GetConsoleWindow();
-"@
+"@ -ErrorAction SilentlyContinue
 $consoleHwnd = [Win32.Win32Utils]::GetConsoleWindow()
 if ($consoleHwnd -ne [System.IntPtr]::Zero) {
     [Win32.Win32Utils]::ShowWindow($consoleHwnd, 0) | Out-Null
@@ -47,15 +58,24 @@ if ($consoleHwnd -ne [System.IntPtr]::Zero) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Catch-all: any unhandled terminating error shows a messagebox instead of silent exit
+trap {
+    try {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Ethereum Monitor startup error:`n`n$_`n`nAt: $($_.InvocationInfo.PositionMessage)",
+            "ETH Monitor Error", 0, 16)
+    } catch {}
+    exit 1
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$resolvedWalletsFile = if ([System.IO.Path]::IsPathRooted($WalletsFile)) { $WalletsFile } else { Join-Path $scriptDir $WalletsFile }
+
 if (-not $WalletAddresses -or $WalletAddresses.Count -eq 0) {
-    $resolvedWalletsFile = if ([System.IO.Path]::IsPathRooted($WalletsFile)) { $WalletsFile } else { Join-Path $scriptDir $WalletsFile }
     if (Test-Path $resolvedWalletsFile) {
         $WalletAddresses = Get-Content $resolvedWalletsFile | Where-Object {
             -not [string]::IsNullOrWhiteSpace($_) -and -not $_.Trim().StartsWith("#")
         }
-    } else {
-        exit 1
     }
 }
 
@@ -84,7 +104,7 @@ $form.ForeColor = [System.Drawing.Color]::White
 # Header Panel
 $headerPanel = New-Object System.Windows.Forms.Panel
 $headerPanel.Dock = "Top"
-$headerPanel.Height = 55
+$headerPanel.Height = 62
 $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(32, 33, 39)
 $form.Controls.Add($headerPanel)
 
@@ -100,20 +120,19 @@ $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = "Monitoring $($WatchedList.Count) wallet(s) | Poll: ${PollInterval}s"
 $lblStatus.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(160, 160, 170)
-$lblStatus.Location = New-Object System.Drawing.Point(14, 30)
+$lblStatus.Location = New-Object System.Drawing.Point(14, 36)
 $lblStatus.AutoSize = $true
 $headerPanel.Controls.Add($lblStatus)
 
-# Log Viewer TextBox
-$txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.Multiline = $true
+# Log Viewer — manually positioned so it always sits exactly between header and footer
+$txtLog = New-Object System.Windows.Forms.RichTextBox
 $txtLog.ScrollBars = "Vertical"
 $txtLog.ReadOnly = $true
-$txtLog.Dock = "Fill"
 $txtLog.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 20)
 $txtLog.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 230)
 $txtLog.Font = New-Object System.Drawing.Font("Consolas", 10)
 $txtLog.BorderStyle = "None"
+$txtLog.Anchor = "Top, Bottom, Left, Right"
 $form.Controls.Add($txtLog)
 
 # Bottom Status Footer & Controls
@@ -122,6 +141,14 @@ $bottomPanel.Dock = "Bottom"
 $bottomPanel.Height = 36
 $bottomPanel.BackColor = [System.Drawing.Color]::FromArgb(32, 33, 39)
 $form.Controls.Add($bottomPanel)
+
+# Position the log box to fill the gap between header (55px) and footer (36px)
+$script:ResizeLog = {
+    $txtLog.Location = New-Object System.Drawing.Point(0, $headerPanel.Height)
+    $txtLog.Size     = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $headerPanel.Height - $bottomPanel.Height))
+}
+$form.Add_Load($script:ResizeLog)
+$form.Add_Resize($script:ResizeLog)
 
 $lblFooter = New-Object System.Windows.Forms.Label
 $lblFooter.Text = "Closing this window minimizes it to the system tray."
@@ -215,10 +242,20 @@ $contextMenu.Items.Add($exitItem) | Out-Null
 
 $trayIcon.ContextMenuStrip = $contextMenu
 
+# Track the last notification URL so clicking the balloon opens it in the browser
+$script:LastNotifUrl = ""
+
+$trayIcon.Add_BalloonTipClicked({
+    if ($script:LastNotifUrl) {
+        Start-Process $script:LastNotifUrl
+    }
+})
+
 function Send-DesktopNotification {
-    param([string]$Title, [string]$Message)
+    param([string]$Title, [string]$Message, [string]$Url = "")
+    $script:LastNotifUrl = $Url
     [Console]::Beep(800, 180)
-    $trayIcon.ShowBalloonTip(7000, $Title, $Message, [System.Windows.Forms.ToolTipIcon]::Info)
+    $trayIcon.ShowBalloonTip(7000, "Ethereum Monitor | $Title", $Message, [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
 # ------------------------------------------------------------------------------
@@ -231,30 +268,36 @@ $LastBlock = @{}
 # ERC-20 Transfer topic: keccak256("Transfer(address,address,uint256)")
 $ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-# Robust RPC invocation with exponential backoff for HTTP 429 / rate limits
+# Robust RPC invocation — cycles through all endpoints, with exponential backoff on 429
 function Invoke-EthRpcWithRetry {
     param([hashtable]$Payload, [int]$MaxRetries = 4, [int]$InitialDelayMs = 400)
 
-    $body  = $Payload | ConvertTo-Json -Compress
-    $delay = $InitialDelayMs
+    $body = $Payload | ConvertTo-Json -Depth 6 -Compress
 
-    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-        try {
-            $res = Invoke-RestMethod -Uri $RpcUrl -Method Post -ContentType "application/json" -Body $body
-            if ($res.error -and $res.error.code -eq 429) {
-                Start-Sleep -Milliseconds $delay
-                $delay *= 2
-                continue
+    foreach ($endpoint in $script:RpcEndpoints) {
+        $delay = $InitialDelayMs
+        for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+            try {
+                $res = Invoke-RestMethod -Uri $endpoint -Method Post -ContentType "application/json" -Body $body `
+                    -Headers @{ "User-Agent" = "Mozilla/5.0 ETH-Monitor/1.0" }
+                if ($res.error -and $res.error.code -eq 429) {
+                    Start-Sleep -Milliseconds $delay
+                    $delay *= 2
+                    continue
+                }
+                # Success — promote this endpoint to front for next call
+                $script:RpcEndpoints = @($endpoint) + ($script:RpcEndpoints | Where-Object { $_ -ne $endpoint })
+                return $res
+            } catch {
+                $errStr = "$_"
+                if ($errStr -match "429" -or $errStr -match "Too many requests") {
+                    Start-Sleep -Milliseconds $delay
+                    $delay *= 2
+                    continue
+                }
+                # 403 / connection error — try next endpoint
+                break
             }
-            return $res
-        } catch {
-            $errStr = "$_"
-            if ($errStr -match "429" -or $errStr -match "Too many requests") {
-                Start-Sleep -Milliseconds $delay
-                $delay *= 2
-                continue
-            }
-            throw $_
         }
     }
     return $null
@@ -265,6 +308,10 @@ function Get-LatestBlockHex {
     $res = Invoke-EthRpcWithRetry -Payload @{
         jsonrpc = "2.0"; id = 1; method = "eth_blockNumber"; params = @()
     }
+    if (-not $res -or -not $res.result) {
+        Append-Log "WARNING: All RPC endpoints unreachable - will retry next poll."
+        return ""
+    }
     return $res.result   # e.g. "0x12a3b4c"
 }
 
@@ -272,6 +319,7 @@ function Get-LatestBlockHex {
 function Hex-ToLong {
     param([string]$Hex)
     $Hex = $Hex -replace "^0x",""
+    if (-not $Hex) { return 0 }
     return [Convert]::ToInt64($Hex, 16)
 }
 
@@ -281,63 +329,85 @@ function Long-ToHex {
     return "0x{0:x}" -f $Value
 }
 
-# Get ETH balance of an address at a given block (hex), returned in ETH
-function Get-EthBalance {
-    param([string]$Address, [string]$BlockHex = "latest")
-    $res = Invoke-EthRpcWithRetry -Payload @{
-        jsonrpc = "2.0"; id = 1; method = "eth_getBalance"
-        params  = @($Address, $BlockHex)
-    }
-    if (-not $res -or -not $res.result) { return 0.0 }
-    $wei = Hex-ToLong $res.result
-    return [Math]::Round($wei / 1e18, 8)
+# Helper: convert a hex wei string to ETH as double (BigInteger-safe)
+function HexWei-ToEth {
+    param([string]$Hex)
+    $Hex = $Hex -replace "^0x",""
+    if (-not $Hex -or $Hex -eq "0") { return 0.0 }
+    $big = [System.Numerics.BigInteger]::Parse("0" + $Hex, [System.Globalization.NumberStyles]::HexNumber)
+    return [Math]::Round([double]$big / 1e18, 8)
 }
 
-# Retrieve ERC-20 Transfer logs in a block range where the watched wallet is sender OR receiver
+# Scan a single block for plain ETH value transfers involving the watched wallet.
+# Uses eth_getBlockByNumber with full txs — no archive node needed.
+function Get-NativeEthTransfers {
+    param([string]$WalletAddress, [string]$BlockHex)
+
+    $res = Invoke-EthRpcWithRetry -Payload @{
+        jsonrpc = "2.0"; id = 1; method = "eth_getBlockByNumber"
+        params  = @($BlockHex, $true)
+    }
+    if (-not $res -or -not $res.result -or -not $res.result.transactions) { return @() }
+
+    $found = @()
+    foreach ($tx in $res.result.transactions) {
+        if (-not $tx.value -or $tx.value -eq "0x0") { continue }
+        $ethVal = HexWei-ToEth $tx.value
+        if ($ethVal -lt 0.000001) { continue }
+
+        if ($tx.to -and $tx.to.ToLower() -eq $WalletAddress) {
+            $found += [PSCustomObject]@{ Type = "INCOMING"; Amount = $ethVal; Hash = $tx.hash }
+        } elseif ($tx.from -and $tx.from.ToLower() -eq $WalletAddress) {
+            $found += [PSCustomObject]@{ Type = "OUTGOING"; Amount = $ethVal; Hash = $tx.hash }
+        }
+    }
+    return $found
+}
+
+# Retrieve ERC-20 Transfer logs in a block range where the watched wallet is sender OR receiver.
+# Uses two separate queries with explicit topic arrays (no null) for max RPC compatibility.
 function Get-Erc20Transfers {
     param([string]$WalletAddress, [string]$FromBlockHex, [string]$ToBlockHex)
 
     # Pad address to 32-byte topic (0x + 24 zeros + 40-char address without 0x)
     $paddedAddr = "0x" + "0" * 24 + ($WalletAddress -replace "^0x","")
 
-    # Query logs where wallet is the FROM address
+    # Query logs where wallet is the FROM address (topics[1] = sender, topics[2] = any)
     $logsFrom = @()
     $resFrom = Invoke-EthRpcWithRetry -Payload @{
         jsonrpc = "2.0"; id = 1; method = "eth_getLogs"
         params  = @(@{
             fromBlock = $FromBlockHex
             toBlock   = $ToBlockHex
-            topics    = @($ERC20_TRANSFER_TOPIC, $paddedAddr, $null)
+            topics    = @($ERC20_TRANSFER_TOPIC, $paddedAddr)
         })
     }
-    if ($resFrom -and $resFrom.result) { $logsFrom = $resFrom.result }
+    if ($resFrom -and $resFrom.result) { $logsFrom = @($resFrom.result) }
 
-    # Query logs where wallet is the TO address
+    # Query logs where wallet is the TO address (topics[1] = any, topics[2] = receiver)
+    # An empty array [] as a topic means "match any value" in the eth_getLogs spec
     $logsTo = @()
     $resTo = Invoke-EthRpcWithRetry -Payload @{
         jsonrpc = "2.0"; id = 1; method = "eth_getLogs"
         params  = @(@{
             fromBlock = $FromBlockHex
             toBlock   = $ToBlockHex
-            topics    = @($ERC20_TRANSFER_TOPIC, $null, $paddedAddr)
+            topics    = @($ERC20_TRANSFER_TOPIC, @(), $paddedAddr)
         })
     }
-    if ($resTo -and $resTo.result) { $logsTo = $resTo.result }
+    if ($resTo -and $resTo.result) { $logsTo = @($resTo.result) }
 
-    return @($logsFrom) + @($logsTo)
+    return $logsFrom + $logsTo
 }
 
-# Decode a hex uint256 data field (ERC-20 Transfer amount) to a human-readable value.
-# We display raw token units because we don't query decimals to stay dependency-free.
+# Decode a hex uint256 data field (ERC-20 Transfer amount) to a human-readable string.
+# Uses BigInteger to handle full 256-bit token amounts without overflow.
 function Decode-Uint256 {
     param([string]$Hex)
     $Hex = $Hex -replace "^0x",""
-    if ($Hex.Length -gt 16) {
-        # Too large for Int64 — use BigInteger via .NET
-        $big = [System.Numerics.BigInteger]::Parse("0" + $Hex, [System.Globalization.NumberStyles]::HexNumber)
-        return $big.ToString()
-    }
-    return [Convert]::ToInt64($Hex, 16).ToString()
+    if (-not $Hex) { return "0" }
+    $big = [System.Numerics.BigInteger]::Parse("0" + $Hex, [System.Globalization.NumberStyles]::HexNumber)
+    return $big.ToString()
 }
 
 # Shorten an Ethereum address: 0x1234...abcd
@@ -346,60 +416,77 @@ function Short-Address {
     return $Addr.Substring(0, 6) + "..." + $Addr.Substring($Addr.Length - 4)
 }
 
-# Core scan: detect native ETH changes and ERC-20 transfers for one wallet over a block range
+# Core scan: detect native ETH and ERC-20 transfers for one wallet over a block range
 function Check-Transfers {
     param([string]$TargetWallet, [string]$FromBlockHex, [string]$ToBlockHex)
 
     $shortWallet = Short-Address $TargetWallet
-    $prevBlock   = Long-ToHex ((Hex-ToLong $FromBlockHex) - 1)
 
-    # (A) Native ETH balance change
-    try {
-        $balBefore = Get-EthBalance -Address $TargetWallet -BlockHex $prevBlock
-        $balAfter  = Get-EthBalance -Address $TargetWallet -BlockHex $ToBlockHex
-        $ethDiff   = [Math]::Round($balAfter - $balBefore, 8)
-
-        if ($ethDiff -gt 0.000001) {
-            $logMsg = "[$shortWallet] RECEIVED +$ethDiff ETH | https://etherscan.io/address/$TargetWallet"
-            Append-Log $logMsg
-            Send-DesktopNotification -Title "ETH Received [$shortWallet]" -Message "+$ethDiff ETH"
-        } elseif ($ethDiff -lt -0.000001) {
-            $sentAmt = [Math]::Abs($ethDiff)
-            $logMsg  = "[$shortWallet] SENT -$sentAmt ETH | https://etherscan.io/address/$TargetWallet"
-            Append-Log $logMsg
-            Send-DesktopNotification -Title "ETH Sent [$shortWallet]" -Message "-$sentAmt ETH"
-        }
-    } catch {}
-
-    # (B) ERC-20 Token Transfers
-    try {
-        $logs = Get-Erc20Transfers -WalletAddress $TargetWallet -FromBlockHex $FromBlockHex -ToBlockHex $ToBlockHex
-        foreach ($log in $logs) {
-            $contractAddr = $log.address
-            $shortContract = Short-Address $contractAddr
-            $rawAmount = Decode-Uint256 $log.data
-
-            # topics[1] = from, topics[2] = to (each padded to 32 bytes)
-            $fromAddr = "0x" + $log.topics[1].Substring(26)
-            $toAddr   = "0x" + $log.topics[2].Substring(26)
-            $txHash   = $log.transactionHash
-
-            if ($toAddr -eq $TargetWallet) {
-                $logMsg = "[$shortWallet] RECEIVED +$rawAmount Token ($shortContract) | Tx: https://etherscan.io/tx/$txHash"
+    # (A) Native ETH — scan each block in the range for value-bearing transactions
+    $fromNum = Hex-ToLong $FromBlockHex
+    $toNum   = Hex-ToLong $ToBlockHex
+    for ($b = $fromNum; $b -le $toNum; $b++) {
+        $blockHex = Long-ToHex $b
+        $ethTxs = Get-NativeEthTransfers -WalletAddress $TargetWallet -BlockHex $blockHex
+        foreach ($t in $ethTxs) {
+            $txUrl = "https://etherscan.io/tx/$($t.Hash)"
+            if ($t.Type -eq "INCOMING") {
+                $logMsg = "[$shortWallet] RECEIVED +$($t.Amount) ETH | Tx: $txUrl"
                 Append-Log $logMsg
-                Send-DesktopNotification -Title "Token Received [$shortWallet]" -Message "+$rawAmount ($shortContract)"
-            } elseif ($fromAddr -eq $TargetWallet) {
-                $logMsg = "[$shortWallet] SENT -$rawAmount Token ($shortContract) | Tx: https://etherscan.io/tx/$txHash"
+                Send-DesktopNotification -Title "ETH Received" -Message "[$shortWallet] +$($t.Amount) ETH  (click to open Etherscan)" -Url $txUrl
+            } else {
+                $logMsg = "[$shortWallet] SENT -$($t.Amount) ETH | Tx: $txUrl"
                 Append-Log $logMsg
-                Send-DesktopNotification -Title "Token Sent [$shortWallet]" -Message "-$rawAmount ($shortContract)"
+                Send-DesktopNotification -Title "ETH Sent" -Message "[$shortWallet] -$($t.Amount) ETH  (click to open Etherscan)" -Url $txUrl
             }
         }
-    } catch {}
+    }
+
+    # (B) ERC-20 Token Transfers
+    $logs = Get-Erc20Transfers -WalletAddress $TargetWallet -FromBlockHex $FromBlockHex -ToBlockHex $ToBlockHex
+    foreach ($log in $logs) {
+        # Validate: need 3 non-null topics each exactly 66 chars (0x + 64 hex digits)
+        $t0 = "$($log.topics[0])"; $t1 = "$($log.topics[1])"; $t2 = "$($log.topics[2])"
+        if ($log.topics.Count -lt 3 -or $t1.Length -lt 66 -or $t2.Length -lt 66) { continue }
+
+        $contractAddr  = "$($log.address)"
+        if ($contractAddr.Length -lt 6) { continue }
+        $shortContract = Short-Address $contractAddr
+        $rawAmount     = Decode-Uint256 "$($log.data)"
+
+        # topics[1] = from, topics[2] = to — last 40 chars = address (strip 0x000...00 padding)
+        $fromAddr = ("0x" + $t1.Substring(26)).ToLower()
+        $toAddr   = ("0x" + $t2.Substring(26)).ToLower()
+        $txHash   = "$($log.transactionHash)"
+
+        $txUrl = "https://etherscan.io/tx/$txHash"
+        if ($toAddr -eq $TargetWallet) {
+            $logMsg = "[$shortWallet] RECEIVED +$rawAmount Token ($shortContract) | Tx: $txUrl"
+            Append-Log $logMsg
+            Send-DesktopNotification -Title "Token Received" -Message "[$shortWallet] +$rawAmount ($shortContract)  (click to open Etherscan)" -Url $txUrl
+        } elseif ($fromAddr -eq $TargetWallet) {
+            $logMsg = "[$shortWallet] SENT -$rawAmount Token ($shortContract) | Tx: $txUrl"
+            Append-Log $logMsg
+            Send-DesktopNotification -Title "Token Sent" -Message "[$shortWallet] -$rawAmount ($shortContract)  (click to open Etherscan)" -Url $txUrl
+        }
+    }
 }
 
 # ------------------------------------------------------------------------------
 # 6. Startup Initialization & Synchronization
 # ------------------------------------------------------------------------------
+
+# Guard: if no wallets are configured, show a notification and open wallets.txt
+if ($WatchedList.Count -eq 0) {
+    $trayIcon.ShowBalloonTip(10000, "Ethereum Monitor | No Wallets Configured",
+        "Add at least one ETH address to wallets.txt, then restart.", [System.Windows.Forms.ToolTipIcon]::Warning)
+    Append-Log "No wallet addresses found in wallets.txt."
+    Append-Log "Add at least one ETH address and restart the monitor."
+    Start-Process "notepad.exe" $resolvedWalletsFile
+    [System.Windows.Forms.Application]::Run()
+    exit 0
+}
+
 Append-Log "Started Ethereum Transfer Monitor."
 Append-Log "Watching $($WatchedList.Count) wallet(s):"
 foreach ($w in $WatchedList) {
@@ -407,10 +494,17 @@ foreach ($w in $WatchedList) {
 }
 
 $latestHex = Get-LatestBlockHex
+if (-not $latestHex) {
+    Append-Log "ERROR: Could not reach any Ethereum RPC endpoint. Check your internet connection."
+    Append-Log "Retrying on next poll interval..."
+    $latestHex = "0x0"
+}
 foreach ($w in $WatchedList) {
     $LastBlock[$w] = $latestHex
     $shortW = Short-Address $w
-    Append-Log "[$shortW] Synced at block $(Hex-ToLong $latestHex) ($(($latestHex)))"
+    if ($latestHex -ne "0x0") {
+        Append-Log "[$shortW] Synced at block $(Hex-ToLong $latestHex) ($latestHex)"
+    }
     Start-Sleep -Milliseconds 150
 }
 
@@ -426,6 +520,7 @@ $timer.Add_Tick({
     $timer.Stop()
     try {
         $currentBlockHex = Get-LatestBlockHex
+        if (-not $currentBlockHex) { return }
         $currentBlockNum = Hex-ToLong $currentBlockHex
 
         foreach ($w in $WatchedList) {
